@@ -1,5 +1,5 @@
 // server.js — Telnyx Call Control webhook (AU whisper coach)
-// Production-ready; signature verify is optional (set TELNYX_PUBLIC_KEY to enable)
+// Production-hardened: allowlist normalised, optional signature verify, required TTS voice set.
 
 import express from "express";
 import axios from "axios";
@@ -9,9 +9,9 @@ import pino from "pino";
 
 const {
   TELNYX_API_KEY,
-  TELNYX_PUBLIC_KEY,   // if unset, signature verification is skipped
-  FROM_NUMBER,         // +61756060210
-  CONNECTION_ID,       // Application ID
+  TELNYX_PUBLIC_KEY,   // if unset => signature verify skipped (dev)
+  FROM_NUMBER,         // e.g. +61756060210
+  CONNECTION_ID,       // Voice API Application ID (a.k.a. connection_id)
   AI_ASSISTANT_ID,     // assistant-xxxx...
   ALLOW_LIST           // comma-separated: +614...,+61...
 } = process.env;
@@ -23,7 +23,6 @@ if (!TELNYX_API_KEY || !FROM_NUMBER || !CONNECTION_ID) {
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 
-// Normalised allow-list set (always +61…)
 const toE164AU = (n) => {
   if (!n) return null;
   const d = String(n).replace(/[^\d+]/g, "");
@@ -32,6 +31,7 @@ const toE164AU = (n) => {
   if (d.startsWith("0")) return "+61" + d.slice(1);
   return "+61" + d;
 };
+
 const allowList = new Set(
   (ALLOW_LIST || "")
     .split(",")
@@ -42,13 +42,13 @@ const allowList = new Set(
 const telnyx = axios.create({
   baseURL: "https://api.telnyx.com/v2",
   headers: { Authorization: `Bearer ${TELNYX_API_KEY}` },
-  timeout: 10000
+  timeout: 12000
 });
 
 const app = express();
 
-// keep raw body for signature verify + parse json
-app.use(async (req, res, next) => {
+// keep raw for signature verification and parse JSON
+app.use(async (req, _res, next) => {
   try {
     req.rawBody = await getRawBody(req);
     const ct = req.headers["content-type"] || "";
@@ -78,11 +78,13 @@ function verifyTelnyxSignature(req) {
   } catch { return false; }
 }
 
-// helpers with required voice param
+// --- helpers (voice is REQUIRED by Telnyx TTS) ---
+const TTS = { voice: "female", language: "en-AU" };
+
 const speak = (ccid, text) =>
   telnyx.post(`/calls/${ccid}/actions/speak`, {
     payload: text,
-    voice: "female/en-AU"
+    ...TTS
   });
 
 const gatherUsingSpeak = (ccid, prompt, client_state) =>
@@ -92,7 +94,7 @@ const gatherUsingSpeak = (ccid, prompt, client_state) =>
     minimum_digits: 4,
     maximum_digits: 15,
     client_state,
-    voice: "female/en-AU"
+    ...TTS
   });
 
 const gather = (ccid, client_state) =>
@@ -103,12 +105,12 @@ const gather = (ccid, client_state) =>
     client_state
   });
 
+const calls = new Map(); // agent_ccid -> { stage, customer_ccid, conf_id }
+
 app.get("/", (_req, res) => res.status(200).send("OK"));
 
-const calls = new Map(); // agent_ccid -> { stage, conf_id, customer_ccid }
-
 app.post("/telnyx/voice", async (req, res) => {
-  res.sendStatus(200); // acknowledge immediately
+  res.sendStatus(200); // ack fast
 
   if (!verifyTelnyxSignature(req)) {
     log.warn("Invalid Telnyx signature — check TELNYX_PUBLIC_KEY");
@@ -117,25 +119,29 @@ app.post("/telnyx/voice", async (req, res) => {
 
   const ev = req.body?.data;
   if (!ev) return;
+
   const type = ev.event_type;
   const p = ev.payload || {};
   const ccid = p.call_control_id;
   const dir = p.direction;
 
   try {
-    // Incoming call — answer, allow-list check, then prompt
+    // 1) Incoming call -> answer, allowlist, prompt for target
     if (type === "call.initiated" && dir === "incoming") {
-      const fromNorm = toE164AU(p.from?.number);
-      log.info({ from: p.from?.number, fromNorm }, "call.initiated");
+      const fromRaw = p.from?.number ?? p.from_number ?? p.caller_id_number ?? null;
+      const fromNorm = toE164AU(fromRaw);
+      log.info({ type, fromRaw, fromNorm }, "call.initiated");
 
       await telnyx.post(`/calls/${ccid}/actions/answer`);
 
-      if (allowList.size && !allowList.has(fromNorm)) {
+      // Only enforce allow-list if we actually have a caller ID
+      if (allowList.size && fromNorm && !allowList.has(fromNorm)) {
         log.info({ fromNorm }, "Rejected: CLID not in allow-list");
         await speak(ccid, "This number is not authorised. Goodbye.");
         await telnyx.post(`/calls/${ccid}/actions/hangup`);
         return;
       }
+      if (!fromNorm) log.warn("No caller ID supplied by Telnyx; skipping allow-list check.");
 
       calls.set(ccid, { stage: "collect", agent_ccid: ccid });
       await gatherUsingSpeak(
@@ -146,11 +152,11 @@ app.post("/telnyx/voice", async (req, res) => {
       return;
     }
 
-    // Got the target digits from agent
+    // 2) Got digits for target
     if (type === "call.gather.ended" && p.client_state === "collect_target") {
       const agent_ccid = ccid;
       const to = toE164AU(p.digits);
-      log.info({ digits: p.digits, to }, "gather complete");
+      log.info({ digits: p.digits, to }, "collect_target result");
 
       if (!to) {
         await speak(agent_ccid, "Invalid number. Goodbye.");
@@ -165,7 +171,7 @@ app.post("/telnyx/voice", async (req, res) => {
       return;
     }
 
-    // Outbound leg answered — create conference, join, start assistant
+    // 3) Outbound leg answered -> create conference & join; start assistant on agent only
     if (type === "call.answered" && dir === "outgoing") {
       const customer_ccid = ccid;
       const agent_ccid = [...calls.keys()].find(k => (calls.get(k)?.stage === "dialling"));
@@ -176,6 +182,7 @@ app.post("/telnyx/voice", async (req, res) => {
         name: `conf-${Date.now()}`
       });
       const conf_id = conf.data?.data?.id;
+
       await telnyx.post(`/conferences/${conf_id}/actions/join`, { call_control_id: customer_ccid });
 
       if (AI_ASSISTANT_ID) {
@@ -190,7 +197,7 @@ app.post("/telnyx/voice", async (req, res) => {
       return;
     }
 
-    // Whisper trigger on *2
+    // 4) Whisper trigger (*2) on agent leg
     if (type === "call.gather.ended" && p.client_state === "listen_whisper") {
       if (p.digits === "*2") {
         await speak(ccid, "Recommend the ninety nine per user plan, then confirm how many users.");
@@ -199,11 +206,13 @@ app.post("/telnyx/voice", async (req, res) => {
       return;
     }
 
+    // 5) Optional insights
     if (type === "call.conversation_insights.generated") {
       log.info({ insights: ev.payload }, "insights");
       return;
     }
 
+    // 6) Cleanup
     if (type === "call.hangup") {
       const entry = calls.get(ccid) || [...calls.values()].find(v => v.customer_ccid === ccid);
       if (entry) calls.delete(entry.agent_ccid);
@@ -217,4 +226,5 @@ app.post("/telnyx/voice", async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => log.info(`listening on :${PORT}`));
+
 
