@@ -1,6 +1,6 @@
 // server.js — Telnyx Call Control webhook (AU whisper coach)
-// Enhanced logging: every Telnyx API call logs success/failure + request IDs.
-// Base64 client_state, TTS voice set, allowlist normalised, optional signature verify.
+// Enhanced media/conference logging.
+// Base64 client_state, AU TTS, allow-list normalised, optional signature verify.
 
 import express from "express";
 import axios from "axios";
@@ -10,10 +10,10 @@ import pino from "pino";
 
 const {
   TELNYX_API_KEY,
-  TELNYX_PUBLIC_KEY,   // leave empty to skip signature verify in dev
+  TELNYX_PUBLIC_KEY,   // leave blank to skip signature verify in dev
   FROM_NUMBER,         // e.g. +61756060210
-  CONNECTION_ID,       // Voice API Application ID (a.k.a. connection_id)
-  AI_ASSISTANT_ID,     // assistant-xxxx...
+  CONNECTION_ID,       // Voice API Application ID
+  AI_ASSISTANT_ID,     // assistant-xxxx
   ALLOW_LIST
 } = process.env;
 
@@ -28,7 +28,7 @@ const log = pino({ level: process.env.LOG_LEVEL || "info" });
 const b64 = (s) => Buffer.from(String(s), "utf8").toString("base64");
 const b64eq = (incoming, plain) => String(incoming || "") === b64(plain);
 
-const toE164AU = (n) => {
+const toE164AU = n => {
   if (!n) return null;
   const d = String(n).replace(/[^\d+]/g, "");
   if (d.startsWith("+")) return d;
@@ -55,9 +55,7 @@ async function post(path, body, label, meta = {}) {
   try {
     const r = await telnyx.post(path, body);
     log.info({
-      label,
-      path,
-      status: r.status,
+      label, path, status: r.status,
       requestId: r.headers["x-request-id"] || r.headers["x-telnyx-request-id"] || null,
       meta
     }, "telnyx.ok");
@@ -65,8 +63,7 @@ async function post(path, body, label, meta = {}) {
   } catch (e) {
     const data = e?.response?.data;
     log.error({
-      label,
-      path,
+      label, path,
       status: e?.response?.status || null,
       requestId: e?.response?.headers?.["x-request-id"] || e?.response?.headers?.["x-telnyx-request-id"] || null,
       err: data || e.message,
@@ -109,7 +106,7 @@ function verifyTelnyxSignature(req) {
   } catch { return false; }
 }
 
-// ---------- TTS helpers (voice required by Telnyx) ----------
+// ---------- TTS helpers (voice is required by Telnyx) ----------
 const TTS = { voice: "female", language: "en-AU" };
 
 async function speak(ccid, text) {
@@ -139,7 +136,7 @@ async function gather(ccid, clientStatePlain) {
   }, "gather", { ccid });
 }
 
-async function dial(agentCcid, to) {
+async function dial(to) {
   log.info({ to }, "action.create_outbound_leg");
   const r = await post("/calls", { connection_id: CONNECTION_ID, to, from: FROM_NUMBER }, "create_call", { to });
   const outCcid = r?.data?.data?.call_control_id;
@@ -173,7 +170,7 @@ app.get("/", (_req, res) => res.status(200).send("OK"));
 
 // ---------- webhook ----------
 app.post("/telnyx/voice", async (req, res) => {
-  res.sendStatus(200); // ack fast
+  res.sendStatus(200);
 
   if (!verifyTelnyxSignature(req)) {
     log.warn("Invalid Telnyx signature — check TELNYX_PUBLIC_KEY");
@@ -189,7 +186,7 @@ app.post("/telnyx/voice", async (req, res) => {
   const dir = p.direction;
 
   try {
-    // Inbound call arrives
+    // Inbound initiated
     if (type === "call.initiated" && dir === "incoming") {
       const fromRaw  = p.from?.number ?? p.from_number ?? p.caller_id_number ?? null;
       const fromNorm = toE164AU(fromRaw);
@@ -206,54 +203,46 @@ app.post("/telnyx/voice", async (req, res) => {
       if (!fromNorm) log.warn("No caller ID; skipping allow-list check.");
 
       calls.set(ccid, { stage: "collect", agent_ccid: ccid });
-      await gatherUsingSpeak(
-        ccid,
-        "Enter the number to call, then press hash.",
-        "collect_target"
-      );
+      await gatherUsingSpeak(ccid, "Enter the number to call, then press hash.", "collect_target");
       return;
     }
 
-    // Received digits from agent
+    // Got target digits
     if (type === "call.gather.ended" && b64eq(p.client_state, "collect_target")) {
-      const agentCcid = ccid;
       const to = toE164AU(p.digits);
       log.info({ digits: p.digits, to }, "collect_target.result");
 
       if (!to) {
-        await speak(agentCcid, "Invalid number. Goodbye.");
-        await post(`/calls/${agentCcid}/actions/hangup`, {}, "hangup.invalid", { agentCcid });
+        await speak(ccid, "Invalid number. Goodbye.");
+        await post(`/calls/${ccid}/actions/hangup`, {}, "hangup.invalid", { ccid });
         return;
       }
 
-      await dial(agentCcid, to);
-      const s = calls.get(agentCcid) || {};
+      await dial(to);
+      const s = calls.get(ccid) || {};
       s.stage = "dialling";
-      calls.set(agentCcid, s);
+      calls.set(ccid, s);
       return;
     }
 
-    // Outbound leg answered
+    // Outbound answered
     if (type === "call.answered" && dir === "outgoing") {
       const customerCcid = ccid;
       const agentCcid = [...calls.keys()].find(k => (calls.get(k)?.stage === "dialling"));
-      if (!agentCcid) {
-        log.warn({ customerCcid }, "outgoing.answered.without_agent_state");
-        return;
-      }
+      log.info({ agentCcid, customerCcid }, "outgoing.answered");
+      if (!agentCcid) return;
 
       const confId = await createConference(agentCcid);
-      await joinConference(confId, customerCcid, "participant");
-
-      await startAssistantOnAgent(agentCcid);
-      await gather(agentCcid, "listen_whisper");
+      await joinConference(confId, customerCcid, "participant"); // join customer
+      await startAssistantOnAgent(agentCcid);                    // AI whisper on agent
+      await gather(agentCcid, "listen_whisper");                 // watch for *2
 
       calls.set(agentCcid, { stage: "live", agent_ccid: agentCcid, customer_ccid: customerCcid, conf_id: confId });
       log.info({ confId, agentCcid, customerCcid }, "conference.live");
       return;
     }
 
-    // Whisper control on agent leg
+    // Whisper key listening on agent leg
     if (type === "call.gather.ended" && b64eq(p.client_state, "listen_whisper")) {
       log.info({ digits: p.digits }, "whisper.dtmf");
       if (p.digits === "*2") {
@@ -263,7 +252,30 @@ app.post("/telnyx/voice", async (req, res) => {
       return;
     }
 
-    // Optional: AI insights
+    // ---- MEDIA / CONFERENCE VISIBILITY ----
+    // Log any relevant “media-ish” events so we can trace audio path.
+    if (type === "conference.participant.joined" || type === "conference.participant.left") {
+      log.info({
+        type,
+        conference_id: p?.conference_id,
+        call_control_id: p?.call_control_id,
+        participant_id: p?.participant_id,
+        role: p?.role
+      }, "conference.participant.event");
+      return;
+    }
+
+    if (type.startsWith("call.speak.")) {
+      log.info({ type, ccid, payload: { state: p?.state } }, "speak.event");
+      return;
+    }
+
+    if (type.startsWith("call.gather.")) {
+      log.info({ type, ccid, payload: { digits: p?.digits, client_state: p?.client_state } }, "gather.event");
+      // don't return; we already handle gather.ended paths above
+    }
+
+    // Optional insights
     if (type === "call.conversation_insights.generated") {
       log.info({ insights: ev.payload }, "assistant.insights");
       return;
